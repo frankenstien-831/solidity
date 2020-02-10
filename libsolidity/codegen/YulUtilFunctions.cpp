@@ -2033,3 +2033,16 @@ string YulUtilFunctions::revertReasonIfDebug(string const& _message)
 {
 	return revertReasonIfDebug(m_revertStrings, _message);
 }
+
+string YulUtilFunctions::rethrowCode() const
+{
+	if (m_evmVersion.supportsReturndata())
+		return R"({
+			// re-throw
+			returndatacopy(0, 0, returndatasize())
+			revert(0, returndatasize())
+		})"s;
+	else
+		return "revert(0, 0) // re-throw\n"s;
+}
+

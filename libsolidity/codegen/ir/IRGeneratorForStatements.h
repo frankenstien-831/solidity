@@ -67,6 +67,12 @@ public:
 	void endVisit(Identifier const& _identifier) override;
 	bool visit(Literal const& _literal) override;
 
+	bool visit(TryStatement const& _tryStatement) override;
+	void handleCatch(std::vector<ASTPointer<TryCatchClause>> const& _catchClauses);
+	void handleCatchStructured(TryCatchClause const& _structured, TryCatchClause const* _fallback);
+	void handleCatchFallback(TryCatchClause const& _fallback);
+	bool visit(TryCatchClause const& _tryCatchClause) override;
+
 private:
 	/// Appends code to call an external function with the given arguments.
 	/// All involved expressions have already been visited.

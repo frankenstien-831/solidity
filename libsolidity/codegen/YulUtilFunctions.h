@@ -297,6 +297,10 @@ public:
 	static std::string revertReasonIfDebug(RevertStrings revertStrings, std::string const& _message = "");
 
 	std::string revertReasonIfDebug(std::string const& _message = "");
+
+	/// Generates code to rethrow an exception.
+	std::string rethrowCode() const;
+
 private:
 	/// Special case of conversionFunction - handles everything that does not
 	/// use exactly one variable to hold the value.

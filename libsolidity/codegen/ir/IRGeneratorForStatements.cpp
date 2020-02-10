@@ -41,6 +41,7 @@
 #include <libsolutil/Keccak256.h>
 #include <libsolutil/Visitor.h>
 
+#include <boost/range/adaptor/reversed.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 
 using namespace std;
@@ -1231,15 +1232,25 @@ void IRGeneratorForStatements::appendExternalFunctionCall(
 		mstore(<pos>, <shl28>(<funId>))
 		let <end> := <encodeArgs>(add(<pos>, 4) <argumentString>)
 
-		let <result> := <call>(<gas>, <address>, <?hasValue> <value>, </hasValue> <pos>, sub(<end>, <pos>), <pos>, <reservedReturnSize>)
-		if iszero(<result>) { <forwardingRevert>() }
+		let <result> := <call>(<gas>, <address>, <?hasValue> <value>, </hasValue> <pos>, sub(<end>, <pos>), <pos>,
+			<?dynamicReturnSize>
+				0
+			<!dynamicReturnSize>
+				<reservedReturnSize>
+			</dynamicReturnSize>
+		)
+		<?isTryCall>
+			let <trySuccessConditionVariable> := <result>
+		<!isTryCall>
+			if iszero(<result>) { <forwardingRevert>() }
 
-		<?dynamicReturnSize>
-			returndatacopy(<pos>, 0, returndatasize())
-		</dynamicReturnSize>
+			<?dynamicReturnSize>
+				returndatacopy(<pos>, 0, returndatasize())
+			</dynamicReturnSize>
 
-		mstore(<freeMemoryPointer>, add(<pos>, and(add(<returnSize>, 0x1f), not(0x1f))))
-		<?returns> let <retVars> := </returns> <abiDecode>(<pos>, add(<pos>, <returnSize>))
+			mstore(<freeMemoryPointer>, add(<pos>, and(add(<returnSize>, 0x1f), not(0x1f))))
+			<?returns> let <retVars> := </returns> <abiDecode>(<pos>, add(<pos>, <returnSize>))
+		</isTryCall>
 	)");
 	templ("pos", m_context.newYulVariable());
 	templ("end", m_context.newYulVariable());
@@ -1249,6 +1260,10 @@ void IRGeneratorForStatements::appendExternalFunctionCall(
 	templ("shl28", m_utils.shiftLeftFunction(8 * (32 - 4)));
 	templ("funId", IRVariable(_functionCall.expression()).part("functionIdentifier").name());
 	templ("address", IRVariable(_functionCall.expression()).part("address").name());
+
+	templ("isTryCall", _functionCall.annotation().tryCall);
+	if (_functionCall.annotation().tryCall)
+		templ("trySuccessConditionVariable", m_context.trySuccessConditionVariable(_functionCall));
 
 	// If the function takes arbitrary parameters or is a bare call, copy dynamic length data in place.
 	// Move arguments to memory, will not update the free memory pointer (but will update the memory
@@ -1640,4 +1655,176 @@ Type const& IRGeneratorForStatements::type(Expression const& _expression)
 {
 	solAssert(_expression.annotation().type, "Type of expression not set.");
 	return *_expression.annotation().type;
+}
+
+bool IRGeneratorForStatements::visit(TryStatement const& _tryStatement)
+{
+	_tryStatement.externalCall().accept(*this);
+
+	auto const trySuccessCondition = m_context.trySuccessConditionVariable(_tryStatement.externalCall());
+
+	m_code << "switch iszero(" << trySuccessCondition << ")\n";
+
+	m_code << "case 0 { // success case\n";
+	_tryStatement.clauses().front()->accept(*this);
+	m_code << "}\n";
+
+	m_code << "default { // failure case\n";
+	handleCatch(_tryStatement.clauses());
+	m_code << "}\n";
+
+	return false;
+}
+
+inline tuple<TryCatchClause*, TryCatchClause*> extractCatchClauses(vector<ASTPointer<TryCatchClause>> const& _catchClauses)
+{
+	TryCatchClause* structured{};
+	TryCatchClause* fallback{};
+
+	for (size_t i = 1; i < _catchClauses.size(); ++i)
+		if (_catchClauses[i]->errorName() == "Error")
+			structured = _catchClauses[i].get();
+		else if (_catchClauses[i]->errorName().empty())
+			fallback = _catchClauses[i].get();
+		else
+			solAssert(false, "");
+
+	solAssert(_catchClauses.size() == size_t(1 + (structured ? 1 : 0) + (fallback ? 1 : 0)), "");
+
+	return tuple{structured, fallback};
+}
+
+void IRGeneratorForStatements::handleCatch(vector<ASTPointer<TryCatchClause>> const& _catchClauses)
+{
+	auto const [structured, fallback] = extractCatchClauses(_catchClauses);
+
+	if (structured)
+		handleCatchStructured(*structured, fallback);
+	else if (fallback)
+		handleCatchFallback(*fallback);
+	else
+		m_code << m_utils.rethrowCode();
+}
+
+void IRGeneratorForStatements::handleCatchStructured(TryCatchClause const& _structured, TryCatchClause const* _fallback)
+{
+	solAssert(
+		_structured.parameters() &&
+		_structured.parameters()->parameters().size() == 1 &&
+		_structured.parameters()->parameters().front() &&
+		*_structured.parameters()->parameters().front()->annotation().type == *TypeProvider::stringMemory(),
+		""
+	);
+	solAssert(m_context.evmVersion().supportsReturndata(), "");
+
+	string const errorHash = FixedHash<4>(util::keccak256("Error(string)")).hex();
+
+	// Try to decode the error message.
+	// If this fails, leaves 0 on the stack, otherwise the pointer to the data string.
+	string const dataVariable = m_context.newYulVariable();
+	string const tryDecodeErrorMessage =
+		util::Whiskers(R"(
+			// try decoding the error message into <data>
+			let <data> := mload(0x40)
+			mstore(<data>, 0)
+			for {} 1 {} {
+				if lt(returndatasize(), 0x44) { <data> := 0 break }
+				returndatacopy(0, 0, 4)
+				let sig := <getSig>
+				if iszero(eq(sig, 0x<ErrorSignature>)) { <data> := 0 break }
+				returndatacopy(<data>, 4, sub(returndatasize(), 4))
+				let offset := mload(<data>)
+				if or(
+					gt(offset, 0xffffffffffffffff),
+					gt(add(offset, 0x24), returndatasize())
+				) {
+					<data> := 0
+					break
+				}
+				let msg := add(<data>, offset)
+				let length := mload(msg)
+				if gt(length, 0xffffffffffffffff) { <data> := 0 break }
+				let end := add(add(msg, 0x20), length)
+				if gt(end, add(<data>, returndatasize())) { <data> := 0 break }
+				mstore(0x40, and(add(end, 0x1f), not(0x1f)))
+				<data> := msg
+				break
+			}
+		)")
+		("ErrorSignature", errorHash)
+		("data", dataVariable)
+		("getSig",
+			m_context.evmVersion().hasBitwiseShifting() ?
+			"shr(224, mload(0))" :
+			"div(mload(0), " + (u256(1) << 224).str() + ")"
+		).render();
+
+	m_code << tryDecodeErrorMessage;
+	m_code << "switch iszero(" << dataVariable << ") \n";
+	m_code << "case 0 { // decoding success\n";
+	_structured.accept(*this);       // decoding success
+	m_code << "}\n";
+	m_code << "default { // decoding failure\n";
+	if (_fallback)
+		handleCatchFallback(*_fallback);
+	else
+		m_code << m_utils.rethrowCode();
+	m_code << "}\n";
+}
+
+void IRGeneratorForStatements::handleCatchFallback(TryCatchClause const& _fallback)
+{
+	if (_fallback.parameters())
+	{
+		solAssert(m_context.evmVersion().supportsReturndata(), "");
+		solAssert(
+			_fallback.parameters()->parameters().size() == 1 &&
+			_fallback.parameters()->parameters().front() &&
+			*_fallback.parameters()->parameters().front()->annotation().type == *TypeProvider::bytesMemory(),
+			""
+		);
+		IRVariable const& v = m_context.addLocalVariable(*_fallback.parameters()->parameters().front());
+		if (!m_context.evmVersion().supportsReturndata())
+			m_code << "let " << v.name() << " := " << CompilerUtils::zeroPointer;
+		else
+			m_code << Whiskers(R"(
+				let <v> := returndatasize()
+				switch v
+				case 0 {
+					<v> := 0x60
+				}
+				default {
+					<v> := mload(0x40)
+					mstore(0x40, add(<v>, and(add(returndatasize(), 0x3f), not(0x1f))))
+					mstore(<v>, returndatasize())
+					returndatacopy(add(<v>, 0x20), 0, returndatasize())
+				}
+			)")
+			("v", v.name())
+			.render();
+	}
+
+	_fallback.accept(*this);
+}
+
+bool IRGeneratorForStatements::visit(TryCatchClause const& _clause) // TODO: fn not complete yet
+{
+	//TODO CompilerContext::LocationSetter locationSetter(m_context, _clause);
+
+	unsigned varSize = 0;
+
+	if (_clause.parameters())
+		for (ASTPointer<VariableDeclaration> const& varDecl: _clause.parameters()->parameters() | boost::adaptors::reversed)
+		{
+			solAssert(varDecl, "");
+			varSize += varDecl->annotation().type->sizeOnStack();
+			//TODO m_context.addVariable(*varDecl, varSize);
+		}
+
+	_clause.block().accept(*this);
+
+	//TODO m_context.removeVariablesAboveStackHeight(m_context.stackHeight() - varSize);
+	//TODO CompilerUtils(m_context).popStackSlots(varSize);
+
+	return false;
 }

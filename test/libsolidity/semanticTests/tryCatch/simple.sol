@@ -1,5 +1,5 @@
 contract C {
-    function g(bool b) public pure returns (uint, uint) {
+    function g(bool b) public pure returns (uint x, uint y) {
         require(b);
         return (1, 2);
     }
@@ -13,6 +13,7 @@ contract C {
 }
 // ====
 // EVMVersion: >=byzantium
+// compileViaYul: also
 // ----
 // f(bool): true -> 1, 2
 // f(bool): false -> 9, 10
